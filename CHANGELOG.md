@@ -1,5 +1,100 @@
 # Changelog
 
+## 2.7.2
+
+- Apps built for macOS 26 that read a pipeline's required threadgroup size no longer quit with an "unrecognized selector" error. Compute pipelines report the size they were created with, and a required size also sets the pipeline's maximum threads per threadgroup.
+- The depth bounds test works. Before, setting depth bounds on a render encoder did nothing, so pixels that should have been skipped were drawn. Pixels are now skipped when the depth already stored in the depth attachment is outside the bounds, as on Apple GPUs.
+- Texture views can be made from a texture view descriptor (macOS 26), with a pixel format, mip levels, slices, and a swizzle.
+- Setting a colour attachment map on a Metal 3 render encoder no longer stops the app. As on Apple GPUs, the map has no effect on a Metal 3 pipeline.
+- Fragment barycentrics are reported only on GPUs whose Vulkan driver provides them, so an app never builds a pipeline the GPU cannot run. On AMD GCN 3 and 4 the Vulkan driver now uses half-precision arithmetic where the hardware has it.
+- The 2.x driver is built for macOS 15 and macOS 26. On any other macOS version it creates no Metal device.
+- AMD and Intel GPU driver (test program, opt-in): AMD GPUs no longer stop at start-up after "register mmio size" (a PCI bridge lookup could loop forever). Safe start-up for RDNA 2, 3 and 3.5, GCN 1 to 3, Polaris cards macOS has no driver for, and Vega APUs. AMD GPUs that Apple's own drivers already run are left alone.
+- Security: fixed races in the NVIDIA kernel driver that let a logged-in user crash the Mac or corrupt kernel memory by binding, mapping, and closing GPU connections at the same time.
+- Security: the display driver no longer publishes kernel addresses where any app can read them.
+- Security: GPU profiling and channel priority now need an administrator. They were open to every user.
+- Security: a setuid or root process ignores the driver's environment settings, and a release build only loads a library named by one from a root-only folder.
+
+## 2.7.1
+
+- OpenGL apps: setting the same render pipeline again inside an open render pass is skipped, so draw-heavy OpenGL apps spend less CPU per draw.
+- ARM apps: the installer keeps /Library/NullMoth readable, so the ARM translator can be reached without the `sudo chmod 711 /Library/NullMoth` workaround.
+- Known issue: Cyberpunk 2077 can still render interiors too bright on some launches. Quit and launch the game again.
+
+## 2.7
+
+- ARM apps (opt-in, experimental): an optional translator for Mac apps built only for Apple silicon. It compiles an app's ARM code into Intel (x86-64) code ahead of time, so the app can run on Intel and AMD hackintoshes. Turn it on in 1401 › ARM apps (opt-in); on Windows, tick Also set up ARM apps (opt-in) on a fresh install. Your original app is never changed, and Turn off removes the translator and every translated copy.
+- ARM apps works today for command-line tools (lz4, xxhsum, cmake and z3 give byte-identical output to Apple silicon). Apps with windows are experimental; Go, Flutter, Java/Electron and SVE video codecs do not work yet, and games are not supported in 2.7. It needs a CPU with AES instructions and the Xcode Command Line Tools.
+- macOS 26 Tahoe has sound. Tahoe ships no HD Audio driver, so PCs on it had no output device at all. The driver package now carries NullMoth's own HD Audio driver and installs it on Tahoe when your PC has an HD Audio controller: onboard Realtek and other codecs (rear and front analog) and NVIDIA HDMI/DisplayPort audio. macOS 15 keeps Apple's own driver and is not touched.
+- If Logic Pro, GarageBand, or MainStage says "Selected Driver not found" after updating, open its Settings › Audio and pick your output again. The old device was Apple's, and it no longer exists.
+- Kernel panics fixed. The driver kept a saved interrupt state inside a shared lock object, which macOS reported as "element modified after free" and which could end in a panic. The state now stays with the caller, as NVIDIA's code expects.
+- Games that run several compute passes at once no longer hit random GPU faults (FAULT_PTE / FAULT_PDE) or show garbage lighting. Concurrent compute work and render passes are now ordered correctly.
+- Resources declared with useHeap: and residency sets stay alive until the GPU is done with them. Before, a heap could be freed under work that still used it.
+- Freed buffers, images, and views keep their GPU address until the work that was in flight when they died has finished.
+- Long sessions no longer run out of GPU connections: the command-pool cache is bounded.
+- The memory a game is told it may use leaves a reserve on the card, so big games run out of VRAM less often.
+- A shader that uses a heap binding its heap was not created with is refused instead of running into a GPU fault.
+- Metal ray tracing: acceleration structures build on the GPU, instance transforms honour the matrix layout the app declares (before, every column-major transform was wrong), builds are thread-safe, and VRAM is checked before a build.
+- Bindless argument-buffer heaps carry storage images and texel buffers, so a shader can write a texture it found through a heap.
+- 10-bit BGR10A2 textures can be written by compute shaders (HDR and 10-bit output render correctly).
+- sRGB images keep their storage use through a compatible UNORM view, so writes to them land.
+- A render pipeline that does not match the open render pass restarts the pass with its attachments kept, instead of the draw being dropped.
+- Indirect compute dispatches prepare the textures declared with useResource:usage: first.
+- Shader translation: make_filled_simdgroup_matrix, barrier scopes, byte-addressed threadgroup memory, pointer phis, device-address arithmetic, and pixel-coordinate sampling now translate correctly.
+- Functions that call visible functions translate once their callees are known.
+- Application profiles: the driver applies per-application settings and shader fixes for one named application, in that process only, with its own shader cache. Cyberpunk 2077's light clustering now renders correctly at about 40 fps on an RTX 5060.
+- GPU compute: convolution kernels use the tensor cores, with a speed gate that keeps Apple's MPS kernel wherever ours is not clearly faster.
+- Shader compiler: small per-thread arrays stay in registers, plus better scheduling, conversion, and load handling.
+- Compute pipelines skip buffer bounds checks (graphics keep them), and small private buffers and images share VRAM blocks.
+- Less CPU per draw and dispatch: binding tables in fixed arrays, fresh system memory is not zeroed twice, and buffers are parked for reuse.
+- Diagnostics that cost speed are compiled out of the release build.
+- Known issue: Cyberpunk 2077's first launch after a restart can render interiors too bright while the game streams its files in. Quit and launch the game again.
+
+## 2.6.6
+
+- Launchpad and Chrome icons are no longer black. 2.6.5 changed how textures made from an IOSurface with no stated use were set up, and shader writes to them went nowhere (PR #461, thanks Geek).
+- Logic Pro no longer crashes when it opens the Dolby Atmos mixer. A texture upload reached the GPU with no image behind it; the copy is now refused, and the log names the texture so the cause can be found.
+- QQ: avatars keep their colour (a clear that finished late could wipe a new upload, PR #458, thanks Geek) and SVG toolbar icons draw (the shader translator refused ANGLE shaders with an empty inline-assembly statement, PR #457, thanks GeekAudio).
+- Hades menu text draws: the shader translator kept a pointer read through a branch merge (PR #466, thanks mickys).
+- Games that ask for rasterization-rate-map coordinates, such as Darkest Dungeon II, get their shaders: the driver reports that it has no rate maps and the translator passes those coordinates through unchanged (PR #469, thanks mickys and Geek).
+- A failed buffer-to-texture copy names its format, sizes and region in the log (PR #465, thanks mickys).
+- The installer notes when the boot-args have no AMFI argument. Without one, WindowServer refuses the Metal driver and the desktop comes up with no Metal device.
+- Tahoe PCs whose integrated GPU drives a screen no longer stop at a black screen with a cursor: a GPU macOS no longer accelerates does not count as the one showing the desktop, so WindowServer starts.
+- macOS Sequoia 15.0 to 15.4 can install the driver again. The Vulkan library in 2.6.2 to 2.6.5 was marked as needing 15.5 though nothing in it does.
+- Security: the driver package is signed, and the Mac app installs a driver update only with a valid NullMoth signature. An installer rollback no longer reuses a firmware folder another account could have placed in /Users/Shared.
+
+## 2.6.5
+
+- WebGL pages with shadow-casting lights draw their shadows: when a page's shadow helper read its sampler through ANGLE's texture table, the shader translator refused the shader, and a second light's shadow map was read as empty (#449, thanks Luminous418).
+- WindowServer does less work per frame: compositor draws no longer rewrite descriptors for the framebuffer-fetch set (PR #439), and command buffers whose completion slot was reused are recognised instead of shutting down the pool (PR #446). Drawables are presented on their own queue, which ends a white-window hang with the Metal HUD on (PR #445). Screen recordings keep their frames in order (PR #438). Thanks GeekAudio (mickys).
+- Photo Booth's preview is no longer black (PR #433, thanks daggersinmybackk).
+- Vivaldi, Opera and Arc get Metal through ANGLE, found by the libraries the process loads (PR #450, thanks SameerAlSahab).
+- Shader translator: depth gather-compare (Civ VI shadows, PR #447), sampler choices across compare chains (PR #448), cube samples through 2D-array views (Stellaris, PR #434), Apple's GL helpers inlined (PR #435). Thanks GeekAudio (mickys).
+- Plugin: Apple's ARGB8 texture format for sampling and uploads (Homeworld, PR #440), depth texture types and sizes reported correctly (Northgard, Dome Keeper, PRs #441 and #432), array lengths kept in struct reflection and encoders return their command buffer (Hades, PRs #437 and #436), block-aligned compressed mip copies (Cult of the Lamb, PR #444), uploads ordered after GPU reads (PR #442), and a trace-ID lock conflict removed (Soulstone Survivors, PR #443). Thanks GeekAudio (mickys).
+
+## 2.6.4
+
+- three.js scenes with two or more shadow-casting lights no longer lose their WebGL2 context in Chrome, Brave and other browsers: the shader translator refused a shader's array of samplers (#426, patch by Luminous418). Each sampler in the array now reaches the shader with its own state. Known: WebGL shadow maps still draw the whole shadowed surface dark, with one light or several (it did in 2.6.3 too); that is the next fix.
+- Arrays of textures read the right texture: every element past the first read the first one, whether the index was fixed or computed in the shader. Shadow maps, texture atlases and material arrays in games and WebGL pages were affected.
+- Machinarium, and other apps whose shaders were built with older Metal tools, draw their scenes: the translator did not recognise a sampler written directly into the shader code, and refused the shader (patch by daggersinmybackk).
+
+## 2.6.3
+
+- Infuse and other players that scale video with Apple's Lanczos filter play again: the shader that filter uses was refused, and the app stopped with "Unable to get MPS kernel lanczosVerticalScale" (#405). Its output now matches a real Mac's pixel for pixel.
+- Geekbench's GPU benchmark runs every test, including the machine-learning ones that use depthwise convolution (#377, PR #385, thanks GeekAudio and Geek).
+- Unity WebGL games and other web pages whose shaders pass a buffer to a helper function render again (#406). Chrome no longer loses its WebGL2 context on pages that write only to textures (#419, patch by eisda).
+- DaVinci Resolve no longer stops at startup on a GTX 1660 Ti: the shader translator read debug notes in Apple's shader code as part of the instructions (PR #418, thanks fayzetwin1).
+- llama.cpp gets correct results instead of zeros (#401).
+- Dragging windows and copying between apps no longer stalls on cards with a small 256 MB BAR1 window: surfaces keep the memory they were given between copies and are read back directly (#368, #399, patch by mrtzygt). A setting you put in your own block of nvrm610.conf now wins over the shipped value.
+- Window dragging no longer stutters, and a crash when a window closed during a copy is fixed (#251, #340, #412). The Dock and Control Center blur is smooth instead of blocky (#363). HiDPI "looks like" sizes appear in Displays (#354). Scrolling in Chromium apps is smoother, and System Settings panes open faster. These come from watchthelight's NvGfx (thanks watchthelight).
+- Display rotation in System Settings (#230, #307, #350, #355, PR #398, thanks razvanccr).
+- HDMI and DisplayPort audio follows the right display when several are connected, and comes back after a mode change (PR #366, thanks Ersiter).
+- A laptop's built-in screen keeps the brightness you set across restarts and power changes (PR #312, thanks Ersiter).
+- Activity Monitor shows how busy the NVIDIA GPU is (PR #380, thanks GeekAudio).
+- Boards whose firmware gives the GPU no 64-bit window keep BAR1 where the firmware put it, and a BAR1 of 512 MB or more that was not moved can flip (PRs #408 and #409, thanks mischa85).
+- Microsoft Edge and other Chromium browsers get Metal through ANGLE by name (PR #404, thanks DoveKi).
+- Minecraft shader packs BSL and Complementary work, and OpenGL apps use uniform buffers (PR #343, thanks Dat 'Del4y' Nguyen).
+- The shader translator is faster (PR #187, thanks modest-tao).
+
 ## 2.6.2
 
 - The same driver as 2.6.0, released with fixes to the 1401 apps for Mac and Windows.

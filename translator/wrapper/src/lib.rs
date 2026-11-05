@@ -51,6 +51,8 @@ fn apply_rsc(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::pas
 
 fn apply_tg(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::passes::TransformOptions {
     o = apply_rsc(o);
+    // Bit 2 is an explicit guarantee from the plugin: no rate map can be created or bound.
+    o.no_rasterization_rate_maps = CAPS.load(Ordering::Relaxed) & 4 != 0;
     for (index, length) in threadgroup_lengths() {
         match o.with_threadgroup_memory_length(index, length) {
             Ok(next) => o = next,
@@ -77,8 +79,31 @@ fn formatless_options(ll: &str, st: Stage, caps: u32) -> Option<metal2vulkan::pa
     Some(o)
 }
 fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
-    match translate_one_as_written(ll, st) {
+    translate_with_pointer_retry(ll, |ll| translate_one_as_written(ll, st))
+}
+
+// Keep the same translation options on both attempts. In particular, the
+// sampler-specialized path must retain pixel coordinates and A8 outputs.
+fn translate_with_pointer_retry(
+    ll: &str, translate: impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    match translate(ll) {
         Ok(v) => Ok(v),
+        // A future loop-edge pointer load can refer to the same immutable local
+        // object field as an earlier load. Before scalar replacement its source
+        // is not yet emitted, so pointer-phi construction cannot recover that
+        // identity. Inline the helpers and forward only fields whose sole store
+        // dominates the reads and whose complete address-use graph is known.
+        Err(e) if e.contains("pointer merge storage mismatch")
+            || (e.contains("pointer phi") && e.contains("differing structural sources")) =>
+        {
+            let Some(inlined) = metal2vulkan::inline_and_forward_object_fields(ll) else { return Err(e) };
+            if let Some(path) = std::env::var_os("NVMTL_DUMP_RETRY_LL") {
+                let _ = std::fs::write(path, &inlined);
+            }
+            translate(&inlined)
+                .map_err(|retry| format!("{e}; retry with immutable local pointer fields forwarded: {retry}"))
+        }
         // A module whose pointers (a sampler's address in an argument buffer, a threadgroup array's address) reach their use
         // only through a local object's fields gets one retry with its helpers inlined and those fields forwarded, and
         // samplers in argument buffers read from the sampler heap. Only a failure gets here, so a module that translates as
@@ -88,7 +113,12 @@ fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
         // there ("exact sampler state was not recovered"), fails the same way with no helper to inline: it gets the retry
         // on its text as written, its argument-buffer samplers read from the sampler heap.
         Err(e) if e.contains("sampler operand is a pointer") || e.contains("pointer placeholder")
-            || e.contains("missing pointer storage") || e.contains("sampler operand is not a sampler") =>
+            || e.contains("missing pointer storage") || e.contains("sampler operand is not a sampler")
+            || e.contains("runtime sampler specialization cannot recover an exact state after pointer selection")
+            // ANGLE's user main left as a call takes the uniform-buffer pointer as an argument, which the emitter types
+            // two ways (#406's "owned IAdd operands", #419; patch by eisda); inlined, the pointer never crosses a call
+            || e.contains("owned OpFunctionCall argument type disagrees") || e.contains("owned IAdd operands do not match")
+            || (e.contains("owned AccessChain") && e.contains("references undefined id")) =>
         {
             let inlined = metal2vulkan::inline_and_forward_object_fields(ll);
             if inlined.is_none() && !e.contains("sampler operand") { return Err(e) }
@@ -99,7 +129,22 @@ fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
             }
             let how = if inlined.is_some() { "with helpers inlined and object fields forwarded" }
                       else { "with argument-buffer samplers from the sampler heap" };
-            metal2vulkan::with_argument_buffer_samplers(|| translate_one_as_written(retry, st))
+            // The call-crossing failures hold no argument-buffer sampler; in the sampler-heap mode their inlined
+            // uniform-buffer read came out as a null constant (#419), so the ordinary translation goes first for them.
+            let call_crossing = e.contains("owned OpFunctionCall argument type disagrees")
+                || e.contains("owned IAdd operands do not match") || e.contains("references undefined id");
+            if call_crossing {
+                if let Some(text) = inlined.as_deref() {
+                    if let Ok(v) = translate(text) { return Ok(v); }
+                }
+            }
+            metal2vulkan::with_argument_buffer_samplers(|| translate(retry))
+                // Forwarding can hand the entry's own [[sampler]] straight to the sample call, the shape Metal's inliner
+                // leaves; such a module reads no sampler from an argument buffer, so it gets the ordinary translation.
+                .or_else(|e2| match inlined.as_deref() {
+                    Some(text) => translate(text).map_err(|e3| format!("{e2}; as ordinary samplers: {e3}")),
+                    None => Err(e2),
+                })
                 .map_err(|e2| format!("{e}; retry {how}: {e2}"))
         }
         Err(e) => Err(e),
@@ -545,6 +590,33 @@ mod align_guard;
 mod table_ubo;
 mod g2_inline;
 mod linearize;
+mod uniform_cbuf;
+
+// Pipeline-local GL optimization. The caller identifies the Metal slot from AIR;
+// failure leaves its already compiled physical-address pipeline available.
+#[no_mangle]
+pub unsafe extern "C" fn nvmtl_promote_gl_uniform(
+    data: *const u8, len: usize, binding: u32, limit: u32,
+    out: *mut *mut u8, out_len: *mut usize, extent: *mut u32,
+    err: *mut c_char, err_len: usize,
+) -> i32 {
+    if data.is_null() || out.is_null() || out_len.is_null() || extent.is_null() { return -1; }
+    *out = std::ptr::null_mut(); *out_len = 0; *extent = 0;
+    match uniform_cbuf::promote(std::slice::from_raw_parts(data, len), binding, limit) {
+        Ok((v, size)) => {
+            let mut b = v.into_boxed_slice();
+            *out = b.as_mut_ptr(); *out_len = b.len(); *extent = size;
+            std::mem::forget(b); 0
+        }
+        Err(e) => {
+            if !err.is_null() && err_len > 0 {
+                let n = e.len().min(err_len - 1);
+                std::ptr::copy_nonoverlapping(e.as_ptr(), err.cast(), n); *err.add(n) = 0;
+            }
+            -1
+        }
+    }
+}
 
 #[cfg(test)]
 mod gl_translation_tests {
@@ -693,7 +765,10 @@ pub unsafe extern "C" fn nvmtl_translate_samplers(
             }
         }
         if used==0 && a8==0{return translate_one(ll,st)}
-        metal2vulkan::translate_native_no_retry_constructed_with_options(ll,st,apply_tg(opts))
+        let opts=apply_tg(opts);
+        translate_with_pointer_retry(ll, |ll| {
+            metal2vulkan::translate_native_no_retry_constructed_with_options(ll,st,opts)
+        })
     })();
     match result {
         Ok(bytes)=>{let mut b=bytes.into_boxed_slice();*out=b.as_mut_ptr();*out_len=b.len();std::mem::forget(b);0}

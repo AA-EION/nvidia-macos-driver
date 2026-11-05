@@ -252,11 +252,11 @@ pub(in crate::passes) fn recovered_image_for_private_operand(
 // the stack overflowed: Geekbench 6's OpenCL Background Blur killed the process (SIGSEGV) instead of reporting why its
 // image operand did not resolve. Each value is described once, three levels deep.
 pub(in crate::passes) fn describe_value(ctx: &Ctx, value: Word) -> String {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::fxhash::HashSet::default();
     describe_value_bounded(ctx, value, 3, &mut seen)
 }
 
-fn describe_value_bounded(ctx: &Ctx, value: Word, depth: u32, seen: &mut std::collections::HashSet<Word>) -> String {
+fn describe_value_bounded(ctx: &Ctx, value: Word, depth: u32, seen: &mut crate::fxhash::HashSet<Word>) -> String {
     if !seen.insert(value) {
         return "(described above)".to_string();
     }
@@ -765,6 +765,9 @@ mod tests {
             ("air.gather_texture_2d.v4f32", (Dim::Dim2D, false)),
             ("air.gather_texture_2d_array.v4f32", (Dim::Dim2D, true)),
             ("air.gather_depth_2d.v4f32", (Dim::Dim2D, false)),
+            ("air.gather_compare_depth_2d.f32", (Dim::Dim2D, false)),
+            ("air.gather_compare_depth_2d_array.f32", (Dim::Dim2D, true)),
+            ("air.gather_compare_depth_cube.f32", (Dim::DimCube, false)),
             ("air.read_texture_2d.v4f32", (Dim::Dim2D, false)),
             ("air.read_texture_2d_array.v4f32", (Dim::Dim2D, true)),
             ("air.read_texture_2d_ms.v4f32", (Dim::Dim2D, false)),

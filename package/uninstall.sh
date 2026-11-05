@@ -4,9 +4,10 @@ set -u
 # fixed PATH those resolve through whatever the caller exported, and kmutil
 # rebuilds the auxiliary kernel collection.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
-# the NVIDIA driver only: the AMD/Intel GPU driver, the NPU driver and the audio driver are separate products with
-# their own uninstallers
-KEXTS="NVRM NVAccel NVRMFB NVRMAGDC NVPrimarySelector"; EXT=/Library/Extensions; GB=/Library/GPUBundles
+# the NVIDIA driver and the audio driver it carries (install.sh puts NMXAudio in on macOS 26). The AMD/Intel GPU and
+# NPU drivers are separate products with their own uninstallers, and removing another product's kext from this one
+# would take out a driver the user still wants.
+KEXTS="NVRM NVAccel NVRMFB NVRMAGDC NVPrimarySelector NMXAudio"; EXT=/Library/Extensions; GB=/Library/GPUBundles
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 K=/System/Library/Kernels/kernel
 KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")   # without a matching Kernel Debug Kit, kmutil needs --allow-missing-kdk
@@ -96,6 +97,7 @@ launchctl bootout system/com.nullmoth.bootguard 2>/dev/null || true
 rm -f /Library/LaunchDaemons/com.nullmoth.bootguard.plist /Library/NullMoth/bootguard.sh || die "cannot remove the boot-guard job"
 nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts 2>/dev/null || true
 nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-ok 2>/dev/null || true
+nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-backlight 2>/dev/null || true
 if [ "$REMOVE_KC" = 1 ]; then
   rm -f "$KC" "$KC.nullmoth-install-new" "$KC.nullmoth-update-new" "$KC.nullmoth-remove-new" || die "cannot remove the auxiliary collection"
 elif [ "$CANDIDATE" = "$NEWKC" ]; then

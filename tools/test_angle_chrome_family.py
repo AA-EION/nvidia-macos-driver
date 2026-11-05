@@ -16,11 +16,21 @@ end = source.index("static bool nvmtl_process_is_allowed(void)")
 region = source[start:end].replace("__attribute__((constructor)) ", "")
 
 fixture = r"""
+#include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #define LOG_NOTICE 5
+// the app path the bundle check reads; "" = a process outside any .app
+static const char *g_path = "";
+int proc_pidpath(int, void *buf, unsigned size) {
+    if (!g_path[0]) return 0;
+    strncpy((char *)buf, g_path, size - 1); ((char *)buf)[size - 1] = 0;
+    return (int)strlen((char *)buf);
+}
 static const char *g_name = "";
 static const char *g_opt = nullptr;
 static char g_angle[1024] = {0};
@@ -40,11 +50,16 @@ int setenv(const char *k, const char *v, int) {
     return 0;
 }
 static void syslog(int, const char *, ...) { g_logs++; }
+// the images dyld reports as loaded; empty = none of ANGLE's
+static const char *g_images[4] = {nullptr};
+uint32_t _dyld_image_count(void) { uint32_t n = 0; while (n < 4 && g_images[n]) n++; return n; }
+const char *_dyld_get_image_name(uint32_t i) { return i < 4 ? g_images[i] : nullptr; }
 
 """ + region + r"""
 
-static void run(const char *name, const char *opt, const char *pre, const char *want) {
+static void run(const char *name, const char *opt, const char *pre, const char *want, const char *path = "") {
     g_name = name;
+    g_path = path;
     g_opt = opt;
     if (pre) {
         strncpy(g_angle, pre, sizeof g_angle - 1);
@@ -61,7 +76,9 @@ static void run(const char *name, const char *opt, const char *pre, const char *
     }
 }
 
-int main() {
+static const char *g_app_exe = "", *g_plain_exe = "";
+int main(int argc, char **argv) {
+    if (argc > 2) { g_app_exe = argv[1]; g_plain_exe = argv[2]; }
     // Chrome and Chromium, including their helper processes, are on by default.
     run("Google Chrome", nullptr, nullptr, "disableMetalOnNvidia");
     run("Google Chrome Helper (Aperitif)", nullptr, nullptr, "disableMetalOnNvidia");
@@ -71,6 +88,20 @@ int main() {
     run("Safari", nullptr, nullptr, "");
     run("Slack Helper (Renderer)", nullptr, nullptr, "");
     run("QQ Helper", nullptr, nullptr, "");
+    // PR #404: Edge, Brave, Electron apps and Discord are on by default too.
+    run("Microsoft Edge Helper (GPU)", nullptr, nullptr, "disableMetalOnNvidia");
+    run("Brave Browser Helper", nullptr, nullptr, "disableMetalOnNvidia");
+    run("Discord Helper (Renderer)", nullptr, nullptr, "disableMetalOnNvidia");
+    // ...and any app whose bundle carries ANGLE or a Chromium framework (path given by the test on argv[1])
+    run("Slack Helper (Renderer)", nullptr, nullptr, "disableMetalOnNvidia", g_app_exe);
+    run("Slack Helper (Renderer)", nullptr, nullptr, "", g_plain_exe);
+    // ...and any process that has ANGLE's own libraries loaded, whatever its name or bundle
+    g_images[0] = "/usr/lib/libSystem.B.dylib";
+    run("Vivaldi Helper (GPU)", nullptr, nullptr, "");
+    g_images[1] = "/Applications/Vivaldi.app/Contents/Frameworks/Vivaldi Framework.framework/Libraries/libGLESv2.dylib";
+    run("Vivaldi Helper (GPU)", nullptr, nullptr, "disableMetalOnNvidia");
+    run("Vivaldi Helper (GPU)", "0", nullptr, "");
+    g_images[1] = nullptr;
     // The environment variable still overrides both ways.
     run("Safari", "1", nullptr, "disableMetalOnNvidia");
     run("Google Chrome", "0", nullptr, "");
@@ -88,8 +119,12 @@ with tempfile.TemporaryDirectory() as tmp:
         ["xcrun", "clang++", "-std=c++17", "-O0", "-x", "c++", "-o", str(exe), "-"],
         input=fixture.encode(), check=True,
     )
-    result = subprocess.run([str(exe)], capture_output=True, text=True)
+    app = pathlib.Path(tmp) / "Slack.app"
+    (app / "Contents/Frameworks/Electron Framework.framework").mkdir(parents=True)
+    (app / "Contents/MacOS").mkdir(parents=True)
+    result = subprocess.run([str(exe), str(app / "Contents/MacOS/Slack Helper"), str(pathlib.Path(tmp) / "plain/bin/tool")],
+                            capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok", result.stdout
 
-print("ok: ANGLE Chrome/Chromium matching, opt-in for other apps, NVMTL_ANGLE_METAL overrides")
+print("ok: ANGLE Chrome/Chromium/Edge/Brave/Electron/Discord matching, app-bundle framework check, loaded ANGLE libraries, opt-in for other apps, NVMTL_ANGLE_METAL overrides")

@@ -6,6 +6,7 @@
 
 #include "nvrm_off.h"
 #include "nv-xnu.h"
+#include "nvrm_utilization.h"
 
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -27,6 +28,11 @@ extern "C" {
 #include <sys/proc.h>
 #include <sys/kauth.h>
 #include <sys/sysctl.h>
+#include <libkern/version.h>
+
+// The 2.x driver is built for macOS 15 (Darwin 24) and macOS 26 (Darwin 25) only; on any other kernel NVRM
+// claims nothing, so NVRMFB and NVRMAGDC, which attach to it, never start either.
+static bool nvrm_kernel_supported(void) { return version_major == 24 || version_major == 25; }
 
 #include "nvrm_gpuva_abi.h"
 #define NVRM_SS_KERNEL_ABI 1
@@ -75,9 +81,7 @@ static void nvrm_display_publish(IOService *provider, NvU32 gpuId)
         NVRMDisplay *nub = OSTypeAlloc(NVRMDisplay);
         if (!nub) break;
         if (!nub->init()) { nub->release(); break; }
-        nub->setProperty("nvkms-kapi", (unsigned long long)(uintptr_t)kapi, 64);
         nub->setProperty("gpu-id", (unsigned long long)gpuId, 32);
-        nub->setProperty("phys-for-va", (unsigned long long)(uintptr_t)&nv_xnu_phys_for_kernel_va, 64);
         nub->setProperty("fb-index", (unsigned long long)i, 32);
         if (!nub->attach(provider)) { nub->release(); break; }
         nub->registerService();
@@ -101,6 +105,7 @@ public:
     virtual IOService *probe(IOService *provider, SInt32 *score) override;
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
+    virtual void free() override;
     IOReturn go(uint32_t pass);
     static void autoGo(void *p0, wait_result_t w);
     static void bootHoldCap(thread_call_param_t p0, thread_call_param_t p1);
@@ -113,7 +118,6 @@ public:
     uint32_t     fAutoGoSettleMs = 10000;
     bool         fBar1Placed = false;
     volatile UInt32 fBootHold = 0;
-    // <wtl>
     // A fixed settle + 40 s cap lost the desktop whenever the GSP bring-up ran long (up to 48 s here); while go(2)
     // runs the cap now waits in 10 s steps, up to nvrmholdcap seconds (default 120). A hung bring-up is still released.
     volatile UInt32 fBringUp = 0;          // 1 from go(2) until the display is armed or the bring-up gave up
@@ -121,7 +125,6 @@ public:
     uint32_t        fHoldCapMs = 120000;   // boot-arg nvrmholdcap (seconds)
     uint32_t        fHoldWaitedMs = 0;     // how long the cap has waited past its first deadline
     thread_call_t   fHoldCapCall = nullptr;
-    // </wtl>
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
                                          void *p1, void *p2, void *p3, void *p4) override;
     virtual IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
@@ -147,6 +150,9 @@ private:
     nv_state_t   fNv = {};
     bool         fPrivateState = false;
     bool         fAdapter = false;
+    IOLock      *fUtilizationLock = nullptr;
+    void        *fUtilizationState = nullptr;
+    bool         fUtilizationStopping = false;
     uint32_t     fPassDone = 0;
     IOWorkLoop  *fWorkLoop = NULL;
     IOFilterInterruptEventSource *fIntSrc = NULL;
@@ -194,6 +200,19 @@ extern "C" void nv_xnu_pm_exit(int counted)
     IOLockLock(gNvPmGate);
     if (--gNvPmUsers == 0 && gNvPmClosed) IOLockWakeup(gNvPmGate, &gNvPmUsers, false);
     IOLockUnlock(gNvPmGate);
+}
+// Telemetry is optional: skip a suspended GPU instead of parking its polling
+// thread until wake. Admission and the users count share the PM gate lock, so
+// suspend cannot pass its drain while a successful admission is still in RM.
+static bool nv_xnu_pm_try_enter(int *counted)
+{
+    *counted = 0;
+    if (!gNvPmGate || current_thread() == gNvPmOwner) return true;
+    IOLockLock(gNvPmGate);
+    const bool ready = !gNvPmClosed;
+    if (ready) { gNvPmUsers++; *counted = 1; }
+    IOLockUnlock(gNvPmGate);
+    return ready;
 }
 // Close the gate and wait up to waitMs for the calls already inside RM. Returns how many were still inside.
 static int nv_xnu_pm_close(uint32_t waitMs)
@@ -306,6 +325,9 @@ private:
     int  fBound = -1;
     SInt32 fCleaned = 0;
     IOLock *fGate = nullptr;      // serialises this client's methods against its own teardown
+    // Guards fMmap and nothing else. It is separate from fGate because RM writes another client's context from inside
+    // that client's neighbour's esc(), and because bind does not hold fGate. Nothing that takes another lock runs under it.
+    IOLock *fMapLock = nullptr;
     // Held across esc() and clientMemoryForType() and across the teardown in clientClose. The RM
     // callbacks below it (nv_add_mapping_context_to_file and friends) must NOT take it: they run
     // nested inside esc() for this same client and IOLock is not recursive.
@@ -329,6 +351,8 @@ public:
     int  boundFd() const { return fBound; }
     bool everBound() const { return fEverBound; }
     int  index() const { return fFd; }
+    bool cleaned() const { return fCleaned != 0; }
+    IOLock *mapLock() const { return fMapLock; }
 };
 extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *isCtl)
 {
@@ -338,6 +362,10 @@ extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *is
     IOLockLock(gNvClientsLock);
     for (int i = 0; i < NV_XNU_MAX_CLIENTS && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && k->boundFd() == (int)fd) c = k; }
     for (int i = 0; i < NV_XNU_MAX_CLIENTS && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && !k->everBound() && k->index() == (int)fd) c = k; }
+    // The caller keeps this client until nv_xnu_put_client. Taken under the table lock: clientClose empties the slot
+    // under the same lock, so a client still in the table cannot have been freed.
+    if (c && c->cleaned()) c = NULL;
+    if (c) c->retain();
     IOLockUnlock(gNvClientsLock);
     if (!c) return NULL;
     if (priv) *priv = c;
@@ -348,6 +376,17 @@ static void nvMmapContextClear(nv_alloc_mapping_context_t *c)
 {
     if (c->memArea.pRanges) kern_os_free(c->memArea.pRanges);
     bzero(c, sizeof *c);
+}
+extern "C" void nv_xnu_put_client(void *priv) { if (priv) ((OSObject *)priv)->release(); }
+extern "C" void nv_xnu_mmap_lock(void *priv)
+{
+    NVRMUserClient *c = OSDynamicCast(NVRMUserClient, (OSObject *)priv);
+    if (c && c->mapLock()) IOLockLock(c->mapLock());
+}
+extern "C" void nv_xnu_mmap_unlock(void *priv)
+{
+    NVRMUserClient *c = OSDynamicCast(NVRMUserClient, (OSObject *)priv);
+    if (c && c->mapLock()) IOLockUnlock(c->mapLock());
 }
 extern "C" nv_alloc_mapping_context_t *nv_xnu_mmap_context(void *priv)
 {
@@ -380,6 +419,7 @@ static inline bool nvrmNameIsUnknown(const char *s)
 IOService *NVRM::probe(IOService *provider, SInt32 *score)
 {
     { if (nvrm_driver_off()) return NULL; }
+    if (!nvrm_kernel_supported()) { LOG("Darwin %d is not supported by this driver: not claiming the GPU", version_major); return NULL; }
     IOService *res = super::probe(provider, score);
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci) return NULL;
@@ -402,10 +442,13 @@ IOService *NVRM::probe(IOService *provider, SInt32 *score)
 bool NVRM::start(IOService *provider)
 {
     { if (nvrm_driver_off()) return false; }
+    if (!nvrm_kernel_supported()) return false;
     nvrm_guard_count_start();
     if (!super::start(provider)) return false;
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;
+    // An unavailable telemetry lock disables this optional interface, not the GPU.
+    fUtilizationLock = IOLockAlloc();
     gNVRMService = this;
     nv_xnu_log_init();
     // The kernel mapping table is serialised, so its lock has to exist before RM maps anything.
@@ -470,7 +513,7 @@ bool NVRM::start(IOService *provider)
             setProperty("nvrm-autogo", "off (-nvrmnogo)"); LOG("auto-go OFF (-nvrmnogo): idle until `nvrmctl go <pass>`");
         } else {
             fBootHold = 1; adjustBusy(1); setProperty("nvrm-boot-hold", "holding");
-            { uint32_t sec = 0; if (PE_parse_boot_argn("nvrmholdcap", &sec, sizeof(sec)) && sec >= 40 && sec <= 600) fHoldCapMs = sec * 1000; }   // <wtl>
+            { uint32_t sec = 0; if (PE_parse_boot_argn("nvrmholdcap", &sec, sizeof(sec)) && sec >= 40 && sec <= 600) fHoldCapMs = sec * 1000; }
             if (thread_call_t cap = thread_call_allocate(&NVRM::bootHoldCap, this)) {
                 // The BAR fallback settles for 100 s. A 40 s timer from start() expired before
                 // autoGo could run, so its display-arm CAS always failed on that path.
@@ -479,7 +522,7 @@ bool NVRM::start(IOService *provider)
                 clock_interval_to_deadline(40000, kMillisecondScale, &dl);
                 clock_interval_to_absolutetime_interval(fAutoGoSettleMs, kMillisecondScale, &settle);
                 dl += settle;
-                fHoldCapCall = cap;   // <wtl> the cap re-arms itself while the bring-up is still running
+                fHoldCapCall = cap;   // the cap re-arms itself while the bring-up is still running
                 retain(); thread_call_enter_delayed(cap, dl);
             } else { releaseBootHold("no cap timer — not holding"); }
             retain();
@@ -709,7 +752,6 @@ void NVRM::releaseBootHold(const char *why)
 void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
 {
     NVRM *s = (NVRM *)p0;
-    // <wtl>
     // bring-up still running and under the ceiling: look again in 10 s (the arm-time retain stays with the call)
     if (s->fBootHold == 1 && s->fBringUp == 1 && s->fHoldWaitedMs + 40000 < s->fHoldCapMs && s->fHoldCapCall) {
         const uint32_t step = 10000;
@@ -721,10 +763,9 @@ void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
         thread_call_enter_delayed(s->fHoldCapCall, dl);
         return;
     }
-    // </wtl>
     if (OSCompareAndSwap(1, 0, &s->fBootHold)) {
         s->adjustBusy(-1); s->setProperty("nvrm-boot-hold", "CAP: bring-up not finished in time, NOT arming");
-        LOG("boot hold RELEASED by the settle + %u s cap — the bring-up will not arm with WindowServer up", 40 + s->fHoldWaitedMs / 1000);   // <wtl> the cap is no longer fixed at 40 s
+        LOG("boot hold RELEASED by the settle + %u s cap — the bring-up will not arm with WindowServer up", 40 + s->fHoldWaitedMs / 1000);   // the cap is no longer fixed at 40 s
     }
     s->release();
 }
@@ -760,18 +801,15 @@ void NVRM::autoGo(void *p0, wait_result_t)
     s->measureBootRaster();
     { thread_t hw = THREAD_NULL; s->retain();
       if (kernel_thread_start(&NVRM::headWatch, s, &hw) == KERN_SUCCESS) thread_deallocate(hw); else s->release(); }
-    // <wtl>
     { uint64_t t; clock_get_uptime(&t); absolutetime_to_nanoseconds(t, &s->fBringUpStartNs); }
     s->fBringUp = 1;
-    // </wtl>
     IOReturn r = s->go(2);
-    // <wtl> how long go(2) took, which says whether the cap was wide enough
+    // how long go(2) took, which says whether the cap was wide enough
     { uint64_t t, ns = 0; clock_get_uptime(&t); absolutetime_to_nanoseconds(t, &ns);
       LOG("auto-go: go(2) took %llu ms (hold cap settle + %u s)", (unsigned long long)((ns - s->fBringUpStartNs) / 1000000ULL), s->fHoldCapMs / 1000); }
-    // </wtl>
     kprintf("NVRM-xnu: auto-go: go(2) -> 0x%x (fPassDone %u)\n", r, s->fPassDone);
     if (r != kIOReturnSuccess) {
-        s->fBringUp = 0;   // <wtl>
+        s->fBringUp = 0;
         s->setProperty("nvrm-autogo", r == kIOReturnBusy ? "busy (a hand-run go is running)" : "go(2) failed");
         s->releaseBootHold("go(2) failed");
     } else {
@@ -790,7 +828,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
             IOSleep(1000);
         }
         LOG("auto-go: heads published mask 0x%x (%u of nvfbheads %d) after %d s", mask, nvrmPop((unsigned)mask), want, i);
-        s->fBringUp = 0;   // <wtl> the cap may fire from here on; the next line decides whether it got there first
+        s->fBringUp = 0;   // the cap may fire from here on; the next line decides whether it got there first
         if (!OSCompareAndSwap(1, 2, &s->fBootHold)) {
             LOG("auto-go: the hold was already released (cap) — NOT arming with WindowServer up; heads 0x%x", mask);
             s->setProperty("nvrm-display", "not armed: hold released by the cap first");
@@ -815,16 +853,18 @@ void NVRM::autoGo(void *p0, wait_result_t)
         LOG("auto-go: display stack: %s", sum);
         s->releaseBootHold(armed == 1 && ag == 1 && iop == 1 ? "display armed" : "display PARTIAL");
         if (armed == 1 && iop == 1 && !PE_parse_boot_argn("-nvrmnoflip", nb, sizeof(nb))) {
-            // Zero-copy scan-out shows only what sits in this GPU's VRAM. Two setups black the screen (cursor only) the
+            // Zero-copy scan-out shows only what sits in this GPU's VRAM. One setup blacks the screen (cursor only) the
             // moment it starts, and every report was fixed by -nvrmnoflip: a second accelerated GPU (Intel/AMD iGPU;
-            // WindowServer composites there, issues #16 #26), and a BAR1 left at its small firmware window (256 MB, no
-            // Resizable BAR; #20 #54 #82). Both keep the copy path, decided below from what is known right now.
-            // This used to sleep 60 s first "so the desktop could come up on the copy path": measured on macOS 26 it
-            // never did - WindowServer presented nothing until the flip path opened, so every boot was a black login
-            // screen for exactly 60 s (72 s on a GTX 1650 SUPER with the login on top). The checks need no wait.
+            // WindowServer composites there, issues #16 #26). The black screens reported for unplaced windows (#54, #82)
+            // also had an iGPU, which the check below covers, so whether BAR1 was moved doesn't decide flipping. That
+            // setup keeps the copy path, decided below from what is known right now.
             const char *why = nullptr;
-            if (!s->fBar1Placed) why = "BAR1 not placed (small firmware window)";
-            else if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
+            // An unplaced BAR1 of 512 MB or more holds the scan-out surfaces, so it may flip. A 256 MB firmware window
+            // keeps the copy path: 12 machines in the field run that way with no iGPU, and none has been tested flipping.
+            const uint64_t bar1MB = s->fNv.bars[NV_GPU_BAR_INDEX_FB].size >> 20;
+            if (!s->fBar1Placed && bar1MB < 512) why = "BAR1 not placed and below 512 MB (small firmware window)";
+            else if (!s->fBar1Placed) LOG("auto-go: BAR1 not placed (%llu MB) - flip allowed", bar1MB);
+            if (!why) if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
                 while (OSObject *o = it->getNextObject()) {
                     const char *cn = o->getMetaClass()->getClassName();
                     if (cn && strncmp(cn, "NV", 2)) { why = "another GPU's accelerator is running"; LOG("auto-go: accelerator %s present", cn); break; }
@@ -1120,9 +1160,14 @@ bool NVRM::placeLargeBar1()
     UInt64 wMin = 0, wMax = 0;
     const unsigned physBits = nvrmPhysBits();
     const UInt64 physTop = physBits >= 63 ? ~0ULL : (1ULL << physBits) - 1;
+    const UInt64 fwBar1 = ((UInt64)old18 << 32) | (lo14 & ~0xFULL);
     if (nvrmHostWindow(fPCI, &wMin, &wMax)) {
         LOG("bar1: host bridge 64-bit window 0x%llx-0x%llx (ACPI _CRS), CPU reaches %u bits", wMin, wMax, physBits);
-    } else if (const char *why = nvrmIntel39Window(physBits, ((UInt64)old18 << 32) | (lo14 & ~0xFULL))) {
+    } else if (fwBar1 < (4ULL << 30)) {
+        // Its BAR1 is fine where it is: with no 64-bit window in _CRS and BAR1 below 4 GB, nothing above 4 GB is routed.
+        LOG("bar1: no 64-bit window in the host bridge's _CRS and the firmware left BAR1 below 4 GB (0x%llx) - not placing", fwBar1);
+        return false;
+    } else if (const char *why = nvrmIntel39Window(physBits, fwBar1)) {
         wMin = kBigBase; wMax = kHostWindowEnd;   // the pre-10-07 placement, kept only where the CPU can reach it
         LOG("bar1: no 64-bit window in the host bridge's _CRS (%s) — using 0x%llx-0x%llx (CPU reaches %u bits)", why, wMin, wMax, physBits);
     } else {
@@ -1460,12 +1505,35 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    // Keep the lock until free(): another service can retain this object and
+    // call its platform interface after stop(), when it must answer NotReady.
+    if (fUtilizationLock) {
+        IOLockLock(fUtilizationLock);
+        fUtilizationStopping = true;
+        const bool haveState = fUtilizationState != nullptr;
+        IOLockUnlock(fUtilizationLock);
+        if (haveState) {
+            // Match the query lock order: PM admission, then the state lock.
+            // An unload during sleep waits for wake under the existing PM gate
+            // contract; it must not send an RM free to a GPU still in standby.
+            NvXnuPmUse pmUse;
+            IOLockLock(fUtilizationLock);
+            nvrm_free_utilization(&fUtilizationState);
+            IOLockUnlock(fUtilizationLock);
+        }
+    }
     if (fPmJoined) { PMstop(); fPmJoined = false; }
     if (fAdapter) { rm_shutdown_adapter(NULL, &fNv); fAdapter = false; }
     if (fIntSrc) { fIntSrc->disable(); if (fWorkLoop) fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = NULL; }
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fPrivateState) { rm_free_private_state(NULL, &fNv); fPrivateState = false; }
     super::stop(provider);
+}
+
+void NVRM::free()
+{
+    if (fUtilizationLock) { IOLockFree(fUtilizationLock); fUtilizationLock = nullptr; }
+    super::free();
 }
 
 extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); void nvkms_xnu_resume(NvU32 gpuId, NvBool gpuOk); }
@@ -1659,6 +1727,20 @@ OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+    if (fn && fn->isEqualTo(NVRM_UTILIZATION_FN)) {
+        NVRMUtilization *sample = (NVRMUtilization *)p1;
+        if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;
+        if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
+        int counted = 0;
+        if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
+        IOLockLock(fUtilizationLock);
+        const bool ready = !fUtilizationStopping && !isInactive() && fAdapter && fPassDone >= 2 &&
+                           OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        const bool ok = ready && nvrm_query_utilization(fNv.gpu_id, &fUtilizationState, sample);
+        IOLockUnlock(fUtilizationLock);
+        nv_xnu_pm_exit(counted);
+        return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
+    }
     if (fn && fn->isEqualTo("NVRMBootRaster")) {
         uint32_t *o4 = (uint32_t *)p1; if (!o4) return kIOReturnBadArgument;
         if (fBootHead < 0) return kIOReturnNotFound;
@@ -1715,6 +1797,13 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         if (fn->isEqualTo(NVRM_SS_FN_PAGEOFF))
             return nvrm_surfshare_pageoff((struct NVRMSurfPageoff *)p1, &fNv) ? kIOReturnIOError : kIOReturnSuccess;
     }
+    if (fn && fn->isEqualTo(NVRM_DISPLAY_PTRS_FN)) {
+        NVRMDisplayPointers *ptrs = (NVRMDisplayPointers *)p1;
+        if (!ptrs || ptrs->version != NVRM_DISPLAY_PTRS_ABI_VERSION) return kIOReturnBadArgument;
+        ptrs->kapi = nvkms_xnu_kapi_table();
+        ptrs->physForVa = (void *)&nv_xnu_phys_for_kernel_va;
+        return ptrs->kapi ? kIOReturnSuccess : kIOReturnNotReady;
+    }
     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
 }
 
@@ -1737,6 +1826,8 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
     fIsCtl = (type == 0);
     fGate = IOLockAlloc();
     if (!fGate) return false;
+    fMapLock = IOLockAlloc();
+    if (!fMapLock) return false;
     nvu_memset(&fNvfp, 0, sizeof fNvfp);
     fNvfp.ctl_nvfp_priv = this;
     if (!gNvClientsLock) gNvClientsLock = IOLockAlloc();
@@ -1792,7 +1883,9 @@ IOReturn NVRMUserClient::clientClose(void)
         // IOMemoryDescriptor::withPhysicalAddress - so freeing it here let a process map whatever
         // landed in the reused block. Marking the context dead is enough; free() does the release,
         // and IOKit only gets there once no method can still be running.
+        IOLockLock(fMapLock);
         fMmap.valid = NV_FALSE;
+        IOLockUnlock(fMapLock);
         if (nv_xnu_chat()) kprintf("NVRM-xnu: client fd %d closed\n", fFd);
     }
     terminate();
@@ -1802,13 +1895,34 @@ void NVRMUserClient::free(void)
 {
     if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
     if (fGate) { IOLockFree(fGate); fGate = nullptr; }
+    if (fMapLock) { IOLockFree(fMapLock); fMapLock = nullptr; }
     super::free();
 }
 IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
     Gate g(fGate);
-    nv_alloc_mapping_context_t *c = &fMmap;
-    if (!c->valid) { kprintf("NVRM-xnu: map on fd %d with no mapping context\n", fFd); return kIOReturnBadArgument; }
+    // Everything below reads this private copy. RM or a bind can replace the live context at any moment, and the ranges
+    // that are checked must be the ranges that are mapped.
+    nv_alloc_mapping_context_t snapshot;
+    MemoryRange *ranges = NULL;
+    IOLockLock(fMapLock);
+    if (!fMmap.valid) {
+        IOLockUnlock(fMapLock);
+        kprintf("NVRM-xnu: map on fd %d with no mapping context\n", fFd);
+        return kIOReturnBadArgument;
+    }
+    snapshot = fMmap;
+    if (!fIsCtl) {
+        const NvU64 count = snapshot.memArea.numRanges;
+        if (count == 0 || count > 4096 || !snapshot.memArea.pRanges) { IOLockUnlock(fMapLock); return kIOReturnBadArgument; }
+        ranges = (MemoryRange *)kern_os_malloc((size_t)(sizeof(MemoryRange) * count));
+        if (!ranges) { IOLockUnlock(fMapLock); return kIOReturnNoMemory; }
+        nvu_memcpy(ranges, snapshot.memArea.pRanges, (size_t)(sizeof(MemoryRange) * count));
+    }
+    IOLockUnlock(fMapLock);
+    snapshot.memArea.pRanges = ranges;
+    struct FreeRanges { MemoryRange *p; ~FreeRanges() { if (p) kern_os_free(p); } } freeRanges = { ranges };
+    nv_alloc_mapping_context_t *c = &snapshot;
     IOMemoryDescriptor *md = NULL;
     NvU32 caching = c->caching;
     if (fIsCtl) {
@@ -1962,9 +2076,15 @@ IOReturn NVRMUserClient::sBindFd(OSObject *target, void *reference, IOExternalMe
     // could be used for a new mapping. Not on detach (a negative value): the userland driver detaches a
     // connection it keeps alive for mappings that are still live, and clearing the context there left those
     // mappings unreleasable, so VRAM filled up and stayed full after the process exited.
-    if (me->fBound >= 0 && me->fMmap.valid) {
-        kprintf("NVRM-xnu: client %d re-bound to fd %d with a stale mapping context - cleared\n", me->fFd, me->fBound);
-        nvMmapContextClear(&me->fMmap);
+    // Under the mapping lock: two binds at once both saw valid and freed the same block, and a bind during a map freed
+    // the ranges that map was reading, so what it checked and what it mapped could differ.
+    if (me->fBound >= 0) {
+        IOLockLock(me->fMapLock);
+        if (me->fMmap.valid) {
+            kprintf("NVRM-xnu: client %d re-bound to fd %d with a stale mapping context - cleared\n", me->fFd, me->fBound);
+            nvMmapContextClear(&me->fMmap);
+        }
+        IOLockUnlock(me->fMapLock);
     }
     if (nv_xnu_chat()) kprintf("NVRM-xnu: client %d bound to pid %d fd %d\n", me->fFd, me->fPid, me->fBound);
     return kIOReturnSuccess;
